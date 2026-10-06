@@ -31,6 +31,24 @@
 A cli to browse and watch anime (alone AND with friends). This tool scrapes the site <a href="https://hianime.at/">hianime.</a>
 </h3>
 
+## gani-cli
+
+Fork of [ani-cli](https://github.com/pystardust/ani-cli) that remembers what you watch with this command.
+
+- `gani-cli` with no search opens a search bar with your recent shows underneath, newest first. The list is a table: show, current episode (and timestamp when you stopped mid-episode), total episodes, and percent watched.
+- Typing clears that list and shows hianime matches for what you typed. Deleting the query brings the recent shows back.
+- Choosing a recent show resumes that episode. mpv also seeks to the saved position. Other players remember the episode only.
+- An episode counts as finished at about 90% watched. The next resume starts the following episode. If that was the last available episode, the show stays in the list as completed.
+- Progress is stored in `~/.local/state/gani-cli/history`. It does not read or write ani-cli's history.
+
+Link this copy onto your PATH without replacing `ani-cli`:
+
+```sh
+ln -sfn "$(pwd)/gani-cli" ~/.local/bin/gani-cli
+```
+
+The sections below describe the upstream tool this fork is based on.
+
 <h1 align="center">
 	Showcase
 </h1>
@@ -39,6 +57,7 @@ A cli to browse and watch anime (alone AND with friends). This tool scrapes the 
 
 ## Table of Contents
 
+- [gani-cli](#gani-cli)
 - [Fixing errors](#fixing-errors)
 - [Install](#install)
   - [Tier 1: Linux, Mac, Android](#tier-1-support-linux-mac-android)

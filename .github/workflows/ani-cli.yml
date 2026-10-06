@@ -5,7 +5,7 @@ on:
       - master
   pull_request:
     paths:
-      - "ani-cli"
+      - "gani-cli"
 
 jobs:
   sh-checker:
@@ -27,7 +27,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: test exec bit
-      run: test -x "./ani-cli"
+      run: test -x "./gani-cli"
 
   check-no-awk:
     name: No Awk Allowed
@@ -35,7 +35,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: verify that noone added awk
-      run: '! grep awk "./ani-cli"'
+      run: '! grep awk "./gani-cli"'
 
   check-no-wget:
     name: No Wget Allowed
@@ -43,4 +43,4 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: verify that noone added wget
-      run: '! grep wget "./ani-cli"'
+      run: '! grep wget "./gani-cli"'

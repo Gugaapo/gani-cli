@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="5.1.5"
+version_number="0.1.0"
 
 # UI
 
@@ -52,7 +52,8 @@ help_info() {
 
     Options:
       -c, --continue
-        Continue watching from history
+        Open recent shows. With no query this screen is the default.
+        Typing there searches. mpv resumes the saved position.
       -d, --download
         Download the video instead of playing it
       -D, --delete
@@ -89,6 +90,8 @@ help_info() {
         Display a countdown to the next episode
       -U, --update
         Update the script
+    With no query, a search bar opens over your recent shows.
+    Progress is saved in ~/.local/state/gani-cli and does not use ani-cli history.
     Some example usages:
       %s -q 720p banana fish
       %s --skip -S 2 one piece
@@ -109,10 +112,11 @@ version_info() {
 
 update_script() {
     info "[branch:$branch] Checking for Update.."
-    update="$($curl_exe --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/pystardust/ani-cli/$branch/ani-cli")" || die "[branch:$branch] Connection error: $update"
+    update="$($curl_exe --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/Gugaapo/gani-cli/$branch/gani-cli")" || die "[branch:$branch] Connection error: $update"
     new_version="$(printf "%s" "$update" | sed -nE 's|^version_number="([^"]+)"$|\1|p')"
     [ -z "$new_version" ] && die "[branch:$branch] Invalid response."
     printf "%s" "$update" | grep -q "^version_number" || die "[branch:$branch] Invalid response."
+    printf "%s" "$update" | grep -q "GANI_CLI_HIST_DIR" || die "[branch:$branch] Remote script is not gani-cli."
     update="$(printf "%s\n" "$update" | diff -u "$0" -)"
     if [ -z "$update" ]; then
         info "[branch:$branch] Script is up to date :) ($version_number)"
@@ -144,7 +148,7 @@ dep_ch_failover() {
 cleanup() {
     [ "$player_function" = "android_mpv" ] && : >"/storage/emulated/0/mpv/mpv.config.mp4" 2>/dev/null
     tput sgr0               # clears colors
-    rm -f "${histfile}.new" # remove temp logfile
+    rm -f "${histfile}.new" "${histfile}.lua"
 }
 
 # SCRAPING
@@ -308,35 +312,401 @@ time_until_next_ep() {
 }
 
 # HISTORY
+# Row format: updated_at, status, position_sec, duration_sec, episode, mode, anime_id, title
 
-backup_old_hist() {
-    backupfile="${histfile}.v4"
-    : >"${histfile}.new"
-    while IFS="	" read -r ep_no anime_id anime_title; do
-        case "$anime_id" in
-            *-*) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new" ;;
-            *) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"$backupfile" ;;
+resolve_script_dir() {
+    _target=$0
+    case "$_target" in
+        */*) ;;
+        *) _target=$(command -v -- "$_target") || _target=$0 ;;
+    esac
+    while [ -L "$_target" ]; do
+        _linkdir=$(dirname "$_target")
+        _target=$(readlink "$_target") || break
+        case "$_target" in
+            /*) ;;
+            *) _target="$_linkdir/$_target" ;;
         esac
-    done <"$histfile"
-    mv "${histfile}.new" "$histfile"
+    done
+    _dir=$(dirname "$_target")
+    (CDPATH= cd -- "$_dir" && pwd)
 }
 
-process_hist_entry() {
-    ep_list=$(hianime_episodes "$anime_id" | cut -f 2)
-    ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
-    [ -n "$ep_no" ] && printf "%s\t%s - episode %s\n" "$anime_id" "$anime_title" "$ep_no"
-}
-
-update_history() {
-    if grep -q "	${anime_id}	" "$histfile"; then
-        # escape sed special chars in replacement: & and \ and delimiter |
-        safe_title=$(printf "%s" "$anime_title" | sed 's|[&\|]|\\&|g')
-        sed -E "s|^[^	]+	${anime_id}	[^	]+$|${ep_no}	${anime_id}	${safe_title}|" "$histfile" >"${histfile}.new"
+format_position() {
+    _sec=${1%.*}
+    case "$_sec" in
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    [ "$_sec" -lt 5 ] && return 0
+    _h=$((_sec / 3600))
+    _m=$(((_sec % 3600) / 60))
+    _s=$((_sec % 60))
+    if [ "$_h" -gt 0 ]; then
+        printf '%d:%02d:%02d' "$_h" "$_m" "$_s"
     else
-        cp "$histfile" "${histfile}.new"
-        printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new"
+        printf '%d:%02d' "$_m" "$_s"
     fi
-    mv "${histfile}.new" "$histfile"
+}
+
+# Fixed columns after the title. Two spaces separate each column.
+table_cols() {
+    if [ -n "${GANI_CLI_COLS:-}" ]; then
+        printf '%s' "$GANI_CLI_COLS"
+        return
+    fi
+    _c=$(tput cols 2>/dev/null) || _c=100
+    case "$_c" in
+        '' | *[!0-9]*) _c=100 ;;
+    esac
+    printf '%s' "$_c"
+}
+
+# Title column tracks the longest show name, and never passes 80.
+# It also leaves room for the other columns and fzf's gutter, so "Watched" stays visible.
+set_title_width() {
+    _max=4
+    if [ -f "$histfile" ]; then
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            [ -z "$_line" ] && continue
+            _t=$(printf '%s' "$_line" | cut -f 8-)
+            _m=$(printf '%s' "$_line" | cut -f 6)
+            [ "$_m" = "dub" ] && _t="$_t (dub)"
+            [ "${#_t}" -gt "$_max" ] && _max=${#_t}
+        done <"$histfile"
+    fi
+    [ "$_max" -gt 80 ] && _max=80
+    # Episode 16 + Total 5 + Watched 7 + three gaps of 2 + fzf gutter
+    _room=$(($(table_cols) - 34 - 4))
+    [ "$_room" -lt 4 ] && _room=4
+    [ "$_max" -gt "$_room" ] && _max=$_room
+    TABLE_TITLE_W=$_max
+}
+
+title_width() {
+    [ -n "${TABLE_TITLE_W:-}" ] || set_title_width
+    printf '%s' "$TABLE_TITLE_W"
+}
+
+fit_text() {
+    _text=$1
+    _width=$2
+    [ "${#_text}" -le "$_width" ] && printf '%s' "$_text" && return 0
+    if [ "$_width" -le 3 ]; then
+        printf '%s' "$_text" | cut -c "1-$_width"
+        return 0
+    fi
+    _keep=$((_width - 3))
+    printf '%s...' "$(printf '%s' "$_text" | cut -c "1-$_keep")"
+}
+
+# $1 episode file, $2 episode, $3 status, $4 position, $5 duration
+# prints "total percent"
+watch_percent() {
+    _list=$1
+    _cur=$2
+    _st=$3
+    _p=$4
+    _d=$5
+    _total=$(grep -c . "$_list" || true)
+    [ "${_total:-0}" -gt 0 ] || return 1
+    _index=$(grep -nxF "$_cur" "$_list" | head -n 1 | cut -d: -f 1)
+    [ -n "$_index" ] || return 1
+    case "$_st" in
+        completed) _pct=100 ;;
+        finished) _pct=$(((_index * 100 + _total / 2) / _total)) ;;
+        *)
+            _before=$((_index - 1))
+            _frac=0
+            _pos_i=${_p%.*}
+            _dur_i=${_d%.*}
+            case "$_pos_i" in '' | *[!0-9]*) _pos_i=0 ;; esac
+            case "$_dur_i" in '' | *[!0-9]*) _dur_i=0 ;; esac
+            if [ "$_dur_i" -gt 0 ] && [ "$_pos_i" -gt 0 ]; then
+                _frac=$((_pos_i * 100 / _dur_i))
+                [ "$_frac" -gt 100 ] && _frac=100
+            fi
+            _pct=$((((_before * 100 + _frac) + _total / 2) / _total))
+            ;;
+    esac
+    [ "$_pct" -gt 100 ] && _pct=100
+    [ "$_pct" -lt 0 ] && _pct=0
+    printf '%s %s\n' "$_total" "$_pct"
+}
+
+history_header_row() {
+    _tw=$(title_width)
+    _label=$(printf '%-*s  %-*s  %-*s  %s' "$_tw" "Show" 16 "Episode" 5 "Total" "Watched")
+    printf 'header\t\t\t\t\t%s\n' "$_label"
+}
+
+format_table_row() {
+    _tw=$(title_width)
+    _title=$(fit_text "$1" "$_tw")
+    _epcell=$2
+    _totalcell=$3
+    _pctcell=$4
+    printf '%-*s  %-*s  %-*s  %s' "$_tw" "$_title" 16 "$_epcell" 5 "$_totalcell" "$_pctcell"
+}
+
+format_history_rows() {
+    [ -f "$histfile" ] || return 0
+    _work=$(mktemp -d) || return 1
+    _n=0
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        [ -z "$_line" ] && continue
+        _n=$((_n + 1))
+        printf '%s\n' "$_line" >"$_work/$_n.meta"
+        _id=$(printf '%s' "$_line" | cut -f 7)
+        (
+            hianime_episodes "$_id" 2>/dev/null | cut -f 2 >"$_work/$_n.eps" || :
+        ) &
+    done <"$histfile"
+    wait
+    _i=1
+    while [ "$_i" -le "$_n" ]; do
+        _line=$(cat "$_work/$_i.meta")
+        _status=$(printf '%s' "$_line" | cut -f 2)
+        _pos=$(printf '%s' "$_line" | cut -f 3)
+        _dur=$(printf '%s' "$_line" | cut -f 4)
+        _ep=$(printf '%s' "$_line" | cut -f 5)
+        _mode=$(printf '%s' "$_line" | cut -f 6)
+        _id=$(printf '%s' "$_line" | cut -f 7)
+        _title=$(printf '%s' "$_line" | cut -f 8-)
+        _i=$((_i + 1))
+        [ -z "$_id" ] && continue
+        [ "$_mode" = "dub" ] && _title="$_title (dub)"
+        _clock=$(format_position "$_pos")
+        if [ "$_status" = "watching" ] && [ -n "$_clock" ]; then
+            _epcell="$_ep  $_clock"
+        else
+            _epcell=$_ep
+        fi
+        _totalcell="-"
+        _pctcell="-"
+        if [ -s "$_work/$((_i - 1)).eps" ]; then
+            _prog=$(watch_percent "$_work/$((_i - 1)).eps" "$_ep" "$_status" "$_pos" "$_dur") || true
+            if [ -n "$_prog" ]; then
+                _totalcell=${_prog%% *}
+                _pctcell="${_prog#* }%"
+            fi
+        fi
+        _display=$(format_table_row "$_title" "$_epcell" "$_totalcell" "$_pctcell")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "resume" "$_id" "$_ep" "$_pos" "$_mode" "$_display"
+    done
+    rm -rf "$_work"
+}
+
+# $1 status, $2 position seconds, $3 duration seconds
+record_watch() {
+    case "$player_function" in
+        debug | download) return 0 ;;
+    esac
+    [ -z "$anime_id" ] && return 0
+    _status=${1:-watching}
+    _pos=${2:-0}
+    _dur=${3:-0}
+    _now=$(date +%s)
+    _tmp="${histfile}.new"
+    : >"$_tmp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$_now" "$_status" "$_pos" "$_dur" "$ep_no" "$mode" "$anime_id" "$anime_title" >>"$_tmp"
+    if [ -f "$histfile" ]; then
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            [ -z "$_line" ] && continue
+            _id=$(printf '%s' "$_line" | cut -f 7)
+            [ "$_id" = "$anime_id" ] && continue
+            printf '%s\n' "$_line" >>"$_tmp"
+        done <"$histfile"
+    fi
+    mv "$_tmp" "$histfile"
+}
+
+history_line_for() {
+    _want=$1
+    [ -f "$histfile" ] || return 1
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _id=$(printf '%s' "$_line" | cut -f 7)
+        if [ "$_id" = "$_want" ]; then
+            printf '%s\n' "$_line"
+            return 0
+        fi
+    done <"$histfile"
+    return 1
+}
+
+prepare_resume() {
+    _line=$(history_line_for "$anime_id") || die "Missing history entry"
+    hist_status=$(printf '%s' "$_line" | cut -f 2)
+    hist_pos=$(printf '%s' "$_line" | cut -f 3)
+    hist_ep=$(printf '%s' "$_line" | cut -f 5)
+    hist_mode=$(printf '%s' "$_line" | cut -f 6)
+    anime_title=$(printf '%s' "$_line" | cut -f 8-)
+    [ "$mode_cli" = 1 ] || mode=$hist_mode
+    episode_maps="$(hianime_episodes "$anime_id")" || exit 1
+    ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
+    if [ -n "$ep_no" ]; then
+        resume_pos=
+        printf '%s\n' "$ep_list" | grep -qxF "$ep_no" || die "Invalid episode!"
+        return 0
+    fi
+    ep_no=$hist_ep
+    resume_pos=
+    case "$hist_status" in
+        finished | completed)
+            _next=$(printf '%s\n' "$ep_list" | sed -n "/^${ep_no}$/{n;p;}")
+            [ -n "$_next" ] && ep_no=$_next
+            ;;
+        *) resume_pos=$hist_pos ;;
+    esac
+    printf '%s\n' "$ep_list" | grep -qxF "$ep_no" || die "Saved episode is no longer available"
+}
+
+select_episodes() {
+    episode_maps="$(hianime_episodes "$anime_id")" || exit 1
+    ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
+    [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
+    [ -z "$ep_no" ] && die "Invalid episode selection"
+    resume_pos=
+}
+
+run_complete() {
+    if [ -z "$query" ]; then
+        _rows=$(format_history_rows)
+        if [ -n "$_rows" ]; then
+            history_header_row
+            printf '%s\n' "$_rows"
+        fi
+        exit 0
+    fi
+    sleep 0.3
+    _results=$(hianime_search "$query") || exit 0
+    [ -z "$_results" ] && exit 0
+    printf '%s\n' "$_results" | while IFS= read -r _sline; do
+        [ -z "$_sline" ] && continue
+        _sid=$(printf '%s' "$_sline" | cut -f 1)
+        _stitle=$(printf '%s' "$_sline" | cut -f 2-)
+        [ -z "$_sid" ] && continue
+        printf 'search\t%s\t\t\t\t%s\n' "$_sid" "$_stitle"
+    done
+    exit 0
+}
+
+launch_fzf() {
+    fzf --reverse --cycle --disabled \
+        --prompt "Search anime: " \
+        --delimiter '\t' \
+        --with-nth 6 \
+        --header-lines "$1" \
+        --header-lines-border line \
+        --bind "change:reload:$0 --complete {q}+transform-header-lines:[ -n {q} ] && echo 0 || echo 1"
+}
+
+fzf_launcher() {
+    GANI_CLI_COLS=$(tput cols 2>/dev/null || printf 100)
+    export GANI_CLI_COLS
+    _rows=$(format_history_rows)
+    if [ -n "$_rows" ]; then
+        {
+            history_header_row
+            printf '%s\n' "$_rows"
+        } | launch_fzf 1
+    else
+        launch_fzf 0
+    fi
+}
+
+plain_launcher() {
+    {
+        printf '0\t__search__\tSearch for a new anime\n'
+        _n=0
+        format_history_rows | while IFS= read -r _row; do
+            [ -z "$_row" ] && continue
+            _n=$((_n + 1))
+            _id=$(printf '%s' "$_row" | cut -f 2)
+            _disp=$(printf '%s' "$_row" | cut -f 6-)
+            printf '%s\t%s\t%s\n' "$_n" "$_id" "$_disp"
+        done
+    } | nth "Select anime: "
+}
+
+parse_launcher_pick() {
+    _tag=$(printf '%s' "$1" | cut -f 1)
+    case "$_tag" in
+        resume | search)
+            pick_tag=$_tag
+            pick_id=$(printf '%s' "$1" | cut -f 2)
+            pick_title=$(printf '%s' "$1" | cut -f 6-)
+            ;;
+        *)
+            pick_id=$(printf '%s' "$1" | cut -f 1)
+            pick_title=$(printf '%s' "$1" | cut -f 2-)
+            if [ "$pick_id" = "__search__" ]; then
+                pick_tag=search
+                pick_id=
+            else
+                pick_tag=resume
+            fi
+            ;;
+    esac
+}
+
+search_flow() {
+    if [ "$menu_program" = "fzf" ]; then
+        while [ -z "$query" ]; do
+            printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+        done
+    else
+        [ -z "$query" ] && query=$(: | menu "Search anime: " "" "$menu_extra_flags")
+        [ -z "$query" ] && exit 1
+    fi
+    [ "$source" = "nextep" ] && time_until_next_ep "$query"
+
+    user_query="$(printf "%s" "$query" | tr '+' ' ')"
+    query=$(printf "%s" "$query" | sed 's| |+|g')
+
+    anime_list=$(hianime_search "$query") || exit 1
+    [ -z "$anime_list" ] && die "No results found!"
+    if [ "$exact_match" = 1 ]; then
+        _query_norm="$(printf "%s" "$user_query" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
+        anime_list="$(printf "%s\n" "$anime_list" | while IFS="$(printf '\t')" read -r _id _title; do
+            _title_norm="$(printf "%s" "$_title" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
+            [ "$_title_norm" = "$_query_norm" ] && printf "%s\t%s\n" "$_id" "$_title"
+        done)"
+        [ -z "$anime_list" ] && die "No exact match found for '$user_query'!"
+    fi
+    [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
+    [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
+    [ -z "$result" ] && die "Invalid anime selection"
+    anime_title="$(printf "%s" "$result" | cut -f 2-)"
+    anime_id="$(printf "%s" "$result" | cut -f 1)"
+    select_episodes
+}
+
+open_launcher() {
+    if [ -n "$index" ] && [ "$index" -eq "$index" ] 2>/dev/null; then
+        _pick=$(format_history_rows | sed -n "${index}p")
+        [ -z "$_pick" ] && die "Invalid selection"
+    elif [ "$menu_program" = "fzf" ]; then
+        _pick=$(fzf_launcher) || exit 0
+        [ -z "$_pick" ] && exit 0
+    else
+        _pick=$(plain_launcher) || true
+        [ -z "$_pick" ] && exit 0
+    fi
+    parse_launcher_pick "$_pick"
+    if [ "$pick_tag" = "search" ]; then
+        if [ -n "$pick_id" ]; then
+            anime_id=$pick_id
+            anime_title=$pick_title
+            select_episodes
+        else
+            query=
+            search_flow
+        fi
+    else
+        anime_id=$pick_id
+        [ -z "$anime_id" ] && exit 1
+        prepare_resume
+    fi
 }
 
 # PLAYING
@@ -361,10 +731,44 @@ android_mpv() {
     nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 &
 }
 
+apply_mpv_progress() {
+    mpv_progress_flags=""
+    _store_pos=0
+    case "$player_function" in
+        *mpv*) ;;
+        *) return 0 ;;
+    esac
+    case "$player_function" in
+        android_mpv) return 0 ;;
+    esac
+    [ -f "$progress_lua" ] || return 0
+    _next=$(printf '%s\n' "$ep_list" | sed -n "/^${ep_no}$/{n;p;}")
+    [ -z "$_next" ] && _next=none
+    # mpv turns the script filename gani-progress.lua into the option prefix gani_progress.
+    mpv_progress_flags="--script=$progress_lua --script-opts-append=gani_progress-hist=$histfile --script-opts-append=gani_progress-id=$anime_id --script-opts-append=gani_progress-ep=$ep_no --script-opts-append=gani_progress-mode=$mode --script-opts-append=gani_progress-next=$_next"
+    if [ -n "$resume_pos" ]; then
+        _sec=${resume_pos%.*}
+        case "$_sec" in
+            '' | *[!0-9]*) ;;
+            *)
+                if [ "$_sec" -ge 5 ]; then
+                    mpv_progress_flags="$mpv_progress_flags --start=$resume_pos"
+                    skip_flag=""
+                    _store_pos=$resume_pos
+                fi
+                ;;
+        esac
+    fi
+}
+
 play_episode() {
-    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${anime_title} ${ep_no}"
+    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t gani-cli "${anime_title} ${ep_no}"
     [ -z "$video_link" ] && get_video_link
+    skip_flag=""
     [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -i "$mal_id" -e "$ep_no")"
+    apply_mpv_progress
+    record_watch watching "${_store_pos:-0}" 0
+    unset resume_pos
     # wait for the previous player to close (in range selection)
     wait
     # shellcheck disable=SC2086
@@ -372,12 +776,12 @@ play_episode() {
         debug) printf "All links:\n%s\nSelected link:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$sub_link" ;;
         android_mpv) android_mpv ;;
         android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
+        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
         *mpv*)
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
             fi
@@ -404,7 +808,6 @@ play_episode() {
     esac
     replay="$video_link"
     unset video_link
-    update_history
     [ "$menu_program" != "fzf" ] && wait
 }
 
@@ -447,34 +850,34 @@ ciphers='ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-A
 tls13_ciphers='TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256'
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-mode="${ANI_CLI_MODE:-sub}"
-download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
-log_episode="${ANI_CLI_LOG:-1}"
-quality="${ANI_CLI_QUALITY:-best}"
-exact_match="${ANI_CLI_EXACT:-0}"
+mode="${GANI_CLI_MODE:-${ANI_CLI_MODE:-sub}}"
+download_dir="${GANI_CLI_DOWNLOAD_DIR:-${ANI_CLI_DOWNLOAD_DIR:-.}}"
+log_episode="${GANI_CLI_LOG:-${ANI_CLI_LOG:-1}}"
+quality="${GANI_CLI_QUALITY:-${ANI_CLI_QUALITY:-best}}"
+exact_match="${GANI_CLI_EXACT:-${ANI_CLI_EXACT:-0}}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
 
 case "$(uname -a | cut -d " " -f 1,3-)" in
     *Darwin*)
         cipher_flag="--ciphers $ciphers --tls13-ciphers $tls13_ciphers"
-        player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}" || die 'No player found. Looked for iina, mpv and vlc'
+        player_function="${GANI_CLI_PLAYER:-${ANI_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}}" || die 'No player found. Looked for iina, mpv and vlc'
         ;;                                                            # mac OS
-    *ndroid*) player_function="${ANI_CLI_PLAYER:-android_mpv}" ;;     # Android OS (termux)
-    *MINGW* | *WSL2*) player_function="${ANI_CLI_PLAYER:-mpv.exe}" ;; # Windows OS
+    *ndroid*) player_function="${GANI_CLI_PLAYER:-${ANI_CLI_PLAYER:-android_mpv}}" ;;     # Android OS (termux)
+    *MINGW* | *WSL2*) player_function="${GANI_CLI_PLAYER:-${ANI_CLI_PLAYER:-mpv.exe}}" ;; # Windows OS
     *ish*)
-        player_function="${ANI_CLI_PLAYER:-iSH}"
+        player_function="${GANI_CLI_PLAYER:-${ANI_CLI_PLAYER:-iSH}}"
         curl_exe=$(dep_ch_failover "curl_safari260_ios,$curl_exe")
         ;;                                                                                                                                                                                               # iOS (iSH)
-    *) player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}" || die 'No player found. Looked for mpv and vlc' ;; # Linux OS
+    *) player_function="${GANI_CLI_PLAYER:-${ANI_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}}" || die 'No player found. Looked for mpv and vlc' ;; # Linux OS
 esac
 
-player_extra_flags="${ANI_CLI_PLAYER_FLAGS:-""}"
-no_detach="${ANI_CLI_NO_DETACH:-0}"
-exit_after_play="${ANI_CLI_EXIT_AFTER_PLAY:-0}"
-skip_intro="${ANI_CLI_SKIP_INTRO:-0}"
-menu_program="${ANI_CLI_MENU:-fzf}"
-menu_extra_flags="${ANI_CLI_MENU_FLAGS:-""}"
+player_extra_flags="${GANI_CLI_PLAYER_FLAGS:-${ANI_CLI_PLAYER_FLAGS:-""}}"
+no_detach="${GANI_CLI_NO_DETACH:-${ANI_CLI_NO_DETACH:-0}}"
+exit_after_play="${GANI_CLI_EXIT_AFTER_PLAY:-${ANI_CLI_EXIT_AFTER_PLAY:-0}}"
+skip_intro="${GANI_CLI_SKIP_INTRO:-${ANI_CLI_SKIP_INTRO:-0}}"
+menu_program="${GANI_CLI_MENU:-${ANI_CLI_MENU:-fzf}}"
+menu_extra_flags="${GANI_CLI_MENU_FLAGS:-${ANI_CLI_MENU_FLAGS:-""}}"
 
 # not opening from a terminal
 if [ ! -t 0 ]; then
@@ -482,13 +885,17 @@ if [ ! -t 0 ]; then
     command -v rofi >/dev/null && menu_program=rofi
 fi
 
-hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
+hist_dir="${GANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gani-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
-histfile="$hist_dir/ani-hsts"
+histfile="$hist_dir/history"
 [ ! -f "$histfile" ] && : >"$histfile"
+script_dir=$(resolve_script_dir) || die "Could not locate gani-cli"
+progress_lua="$script_dir/gani-progress.lua"
 
-source="${ANI_CLI_DEFAULT_SOURCE:-search}"
-branch="${ANI_CLI_BRANCH:-master}"
+source="${GANI_CLI_DEFAULT_SOURCE:-${ANI_CLI_DEFAULT_SOURCE:-search}}"
+branch="${GANI_CLI_BRANCH:-${ANI_CLI_BRANCH:-master}}"
+complete_mode=0
+mode_cli=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -531,7 +938,7 @@ while [ $# -gt 0 ]; do
         -l | --logview)
             case "$(uname -s)" in
                 Darwin*) log show --predicate 'process == "logger"' ;;
-                Linux*) journalctl -t ani-cli ;;
+                Linux*) journalctl -t gani-cli ;;
                 *) die "Logger not implemented for your platform" ;;
             esac
             exit 0
@@ -543,7 +950,8 @@ while [ $# -gt 0 ]; do
             ep_no="$2"
             shift
             ;;
-        --dub) mode="dub" ;;
+        --dub) mode="dub" && mode_cli=1 ;;
+        --complete) complete_mode=1 ;;
         --no-detach) no_detach=1 ;;
         --exit-after-play) exit_after_play=1 && no_detach=1 ;;
         --rofi) menu_program=rofi ;;
@@ -559,6 +967,16 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$complete_mode" = 1 ]; then
+    run_complete
+fi
+
+if [ -n "$query" ]; then
+    [ "$source" = "history" ] && source=search
+elif [ "$source" != "nextep" ]; then
+    source=launcher
+fi
 
 [ "$menu_program" = "fzf" ] && menu_multi_flag="-m"
 [ "$menu_program" = "rofi" ] && menu_multi_flag="-multi-select"
@@ -583,54 +1001,8 @@ trap 'cleanup; exit 1' INT HUP TERM
 
 # searching
 case "$source" in
-    history)
-        backup_old_hist
-        anime_list=$(while read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
-        wait
-        [ -z "$anime_list" ] && die "No unwatched series in history!"
-        [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
-        [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
-        [ -z "$anime_id" ] && exit 1
-        anime_title=$(printf "%s" "$anime_list" | grep "^$anime_id	" | cut -f 2 | sed 's| - episode.*||')
-        episode_maps="$(hianime_episodes "$anime_id")" || exit 1
-        ep_list="$(printf "%s" "$episode_maps" | cut -f 2)"
-        ep_no=$(printf "%s" "$anime_list" | grep "^$anime_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
-        ;;
-    *)
-        if [ "$menu_program" = "fzf" ]; then
-            while [ -z "$query" ]; do
-                printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
-            done
-        else
-            [ -z "$query" ] && query=$(: | menu "Search anime: " "" "$menu_extra_flags")
-            [ -z "$query" ] && exit 1
-        fi
-        # for checking new releases by specifying anime name
-        [ "$source" = "nextep" ] && time_until_next_ep "$query"
-
-        user_query="$(printf "%s" "$query" | tr '+' ' ')"
-        query=$(printf "%s" "$query" | sed 's| |+|g')
-
-        anime_list=$(hianime_search "$query") || exit 1
-        [ -z "$anime_list" ] && die "No results found!"
-        if [ "$exact_match" = 1 ]; then
-            _query_norm="$(printf "%s" "$user_query" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
-            anime_list="$(printf "%s\n" "$anime_list" | while IFS="$(printf '\t')" read -r _id _title; do
-                _title_norm="$(printf "%s" "$_title" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')"
-                [ "$_title_norm" = "$_query_norm" ] && printf "%s\t%s\n" "$_id" "$_title"
-            done)"
-            [ -z "$anime_list" ] && die "No exact match found for '$user_query'!"
-        fi
-        [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
-        [ -z "$result" ] && die "Invalid anime selection"
-        anime_title="$(printf "%s" "$result" | cut -f 2)"
-        anime_id="$(printf "%s" "$result" | cut -f 1)"
-        episode_maps="$(hianime_episodes "$anime_id")" || exit 1
-        ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
-        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
-        [ -z "$ep_no" ] && die "Invalid episode selection"
-        ;;
+    launcher) open_launcher ;;
+    *) search_flow ;;
 esac
 
 # moves the cursor up one line and clears that line
@@ -644,10 +1016,22 @@ play
 
 while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
     case "$cmd" in
-        next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
-        replay) video_link="$replay" ;;
-        previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
-        select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag") ;;
+        next)
+            unset resume_pos
+            ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
+            ;;
+        replay)
+            unset resume_pos
+            video_link="$replay"
+            ;;
+        previous)
+            unset resume_pos
+            ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null
+            ;;
+        select)
+            unset resume_pos
+            ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
+            ;;
         change_quality)
             new_quality="$(printf "%s" "$links" | menu "Select Quality: " "" "$menu_extra_flags" | cut -d ">" -f 1)"
             [ -z "$new_quality" ] && die "No quality selected"
@@ -662,7 +1046,7 @@ while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth 
     play
 done
 
-# ani-cli
+# gani-cli
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -677,4 +1061,5 @@ done
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
-# Project repository: https://github.com/pystardust/ani-cli
+# Based on https://github.com/pystardust/ani-cli
+# Project repository: https://github.com/Gugaapo/gani-cli
