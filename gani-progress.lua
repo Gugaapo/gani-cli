@@ -29,11 +29,38 @@ local function field(line, index)
 	return ""
 end
 
+local function split_fields(line)
+	local fields = {}
+	for value in (line .. "\t"):gmatch("([^\t]*)\t") do
+		fields[#fields + 1] = value
+	end
+	if #fields > 0 and fields[#fields] == "" then
+		fields[#fields] = nil
+	end
+	return fields
+end
+
+local function flag_and_title(fields)
+	if #fields >= 9 then
+		local parts = {}
+		for i = 9, #fields do
+			parts[#parts + 1] = fields[i]
+		end
+		return fields[8] or "", table.concat(parts, "\t")
+	end
+	local parts = {}
+	for i = 8, #fields do
+		parts[#parts + 1] = fields[i]
+	end
+	return "", table.concat(parts, "\t")
+end
+
 local function write_history(status, pos, dur)
 	if o.hist == "" or o.id == "" then
 		return
 	end
 	local title = ""
+	local flag = ""
 	local kept = {}
 	local input = io.open(o.hist, "r")
 	if input then
@@ -45,7 +72,7 @@ local function write_history(status, pos, dur)
 						input:close()
 						return
 					end
-					title = field(line, 8)
+					flag, title = flag_and_title(split_fields(line))
 				else
 					kept[#kept + 1] = line
 				end
@@ -54,7 +81,7 @@ local function write_history(status, pos, dur)
 		input:close()
 	end
 	local row = string.format(
-		"%d\t%s\t%.3f\t%.3f\t%s\t%s\t%s\t%s",
+		"%d\t%s\t%.3f\t%.3f\t%s\t%s\t%s\t%s\t%s",
 		os.time(),
 		status,
 		pos or 0,
@@ -62,6 +89,7 @@ local function write_history(status, pos, dur)
 		o.ep,
 		o.mode,
 		o.id,
+		flag,
 		title
 	)
 	local tmp = o.hist .. ".lua"

@@ -128,6 +128,8 @@ Multiple episodes can be chosen using fzf (or alternative frontend's) multi-sele
 Playback is recorded only for shows started with gani-cli. mpv saves the position inside the current episode and resumes it with --start. Quitting in the last 10% of an episode, or the last 15 seconds, marks that episode finished. The next resume starts the following episode from the beginning. If no later episode exists, the show stays in the list as completed. Other players remember the episode only.
 .PP
 Progress is stored in ~/.local/state/gani-cli/history. ani-cli's own history file is not read or written.
+.PP
+The recent list has a Status column. alt-p marks Plan to Watch, alt-c marks Completed, alt-d marks Dropped, and alt-u clears the mark. alt-f cycles the list through all shows, Watching, Plan to Watch, Completed, and Dropped. alt-s cycles sort by recent, title, progress, and status. The key list is shown under the menu. The current filter and sort are remembered in ~/.local/state/gani-cli/view.
 .SH BUGS
 .PP
 Use the GitHub issue tracker:

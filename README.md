@@ -35,7 +35,8 @@ A cli to browse and watch anime (alone AND with friends). This tool scrapes the 
 
 Fork of [ani-cli](https://github.com/pystardust/ani-cli) that remembers what you watch with this command.
 
-- `gani-cli` with no search opens a search bar with your recent shows underneath, newest first. The list is a table: show, current episode (and timestamp when you stopped mid-episode), total episodes, and percent watched.
+- `gani-cli` with no search opens a search bar with your recent shows underneath, newest first. The list is a table: show, current episode (and timestamp when you stopped mid-episode), total episodes, percent watched, and status.
+- alt-p marks Plan to Watch, alt-c marks Completed, alt-d marks Dropped, and alt-u clears it. alt-f cycles the status filter and alt-s cycles sort (recent, title, progress, status). The keys are listed under the menu.
 - Typing clears that list and shows hianime matches for what you typed. Deleting the query brings the recent shows back.
 - Choosing a recent show resumes that episode. mpv also seeks to the saved position. Other players remember the episode only.
 - An episode counts as finished at about 90% watched. The next resume starts the following episode. If that was the last available episode, the show stays in the list as completed.

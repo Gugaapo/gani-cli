@@ -92,6 +92,9 @@ help_info() {
         Update the script
     With no query, a search bar opens over your recent shows.
     Progress is saved in ~/.local/state/gani-cli and does not use ani-cli history.
+    In that list:
+      alt-p  Plan to Watch    alt-c  Completed    alt-d  Dropped    alt-u  Clear
+      alt-f  cycle the status filter    alt-s  cycle sort (recent, title, progress, status)
     Some example usages:
       %s -q 720p banana fish
       %s --skip -S 2 one piece
@@ -363,20 +366,161 @@ table_cols() {
 
 # Title column tracks the longest show name, and never passes 80.
 # It also leaves room for the other columns and fzf's gutter, so "Watched" stays visible.
+# Optional 9th field is the user flag: plan, completed, or dropped. Older rows omit it.
+parse_history_line() {
+    hist_updated=$(printf '%s' "$1" | cut -f 1)
+    hist_status=$(printf '%s' "$1" | cut -f 2)
+    hist_pos=$(printf '%s' "$1" | cut -f 3)
+    hist_dur=$(printf '%s' "$1" | cut -f 4)
+    hist_ep=$(printf '%s' "$1" | cut -f 5)
+    hist_mode=$(printf '%s' "$1" | cut -f 6)
+    hist_id=$(printf '%s' "$1" | cut -f 7)
+    _hist_rest=$(printf '%s' "$1" | cut -f 9-)
+    if [ -n "$_hist_rest" ]; then
+        hist_flag=$(printf '%s' "$1" | cut -f 8)
+        hist_title=$_hist_rest
+    else
+        hist_flag=
+        hist_title=$(printf '%s' "$1" | cut -f 8-)
+    fi
+}
+
+show_flag_label() {
+    case "$hist_flag" in
+        plan) printf 'Plan to Watch' ;;
+        completed) printf 'Completed' ;;
+        dropped) printf 'Dropped' ;;
+        *)
+            if [ "$hist_status" = "completed" ]; then
+                printf 'Completed'
+            else
+                printf 'Watching'
+            fi
+            ;;
+    esac
+}
+
+read_view() {
+    view_filter=all
+    view_sort=recent
+    [ -f "${view_file:-}" ] || return 0
+    while IFS='=' read -r _vk _vv; do
+        case "$_vk" in
+            filter) view_filter=$_vv ;;
+            sort) view_sort=$_vv ;;
+        esac
+    done <"$view_file"
+}
+
+write_view() {
+    printf 'filter=%s\nsort=%s\n' "$view_filter" "$view_sort" >"$view_file"
+}
+
+cycle_view() {
+    read_view
+    case "$1" in
+        filter)
+            case "$view_filter" in
+                all) view_filter=watching ;;
+                watching) view_filter=plan ;;
+                plan) view_filter=completed ;;
+                completed) view_filter=dropped ;;
+                *) view_filter=all ;;
+            esac
+            ;;
+        sort)
+            case "$view_sort" in
+                recent) view_sort=title ;;
+                title) view_sort=progress ;;
+                progress) view_sort=status ;;
+                *) view_sort=recent ;;
+            esac
+            ;;
+    esac
+    write_view
+}
+
+filter_label() {
+    case "$view_filter" in
+        watching) printf 'Watching' ;;
+        plan) printf 'Plan to Watch' ;;
+        completed) printf 'Completed' ;;
+        dropped) printf 'Dropped' ;;
+        *) printf 'All' ;;
+    esac
+}
+
+sort_label() {
+    case "$view_sort" in
+        title) printf 'Title' ;;
+        progress) printf 'Progress' ;;
+        status) printf 'Status' ;;
+        *) printf 'Recent' ;;
+    esac
+}
+
+print_legend() {
+    read_view
+    printf 'alt-p  Plan to Watch    alt-c  Completed    alt-d  Dropped    alt-u  Clear\n'
+    printf 'alt-f  Filter: %s    alt-s  Sort: %s\n' "$(filter_label)" "$(sort_label)"
+}
+
+apply_show_flag() {
+    _action=$1
+    _file=$2
+    [ -n "$_file" ] && [ -f "$_file" ] || return 0
+    _row=$(head -n 1 "$_file")
+    _tag=$(printf '%s' "$_row" | cut -f 1)
+    _id=$(printf '%s' "$_row" | cut -f 2)
+    [ "$_tag" = "header" ] || [ -z "$_id" ] && return 0
+    case "$_action" in
+        plan | completed | dropped) _flag=$_action ;;
+        clear) _flag= ;;
+        *) return 0 ;;
+    esac
+    _existing=$(history_line_for "$_id" || true)
+    _tmp="${histfile}.new"
+    if [ -n "$_existing" ]; then
+        parse_history_line "$_existing"
+        : >"$_tmp"
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            [ -z "$_line" ] && continue
+            if [ "$(printf '%s' "$_line" | cut -f 7)" = "$_id" ]; then
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$hist_updated" "$hist_status" "$hist_pos" "$hist_dur" "$hist_ep" "$hist_mode" "$hist_id" "$_flag" "$hist_title" >>"$_tmp"
+            else
+                printf '%s\n' "$_line" >>"$_tmp"
+            fi
+        done <"$histfile"
+        mv "$_tmp" "$histfile"
+        return 0
+    fi
+    [ "$_tag" = "search" ] || return 0
+    _title=$(printf '%s' "$_row" | cut -f 6-)
+    [ -n "$_title" ] || return 0
+    _tmp="${histfile}.new"
+    {
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date +%s)" "watching" "0" "0" "" "${mode:-sub}" "$_id" "$_flag" "$_title"
+        [ -f "$histfile" ] && cat "$histfile"
+    } >"$_tmp"
+    mv "$_tmp" "$histfile"
+}
+
 set_title_width() {
     _max=4
     if [ -f "$histfile" ]; then
         while IFS= read -r _line || [ -n "$_line" ]; do
             [ -z "$_line" ] && continue
-            _t=$(printf '%s' "$_line" | cut -f 8-)
-            _m=$(printf '%s' "$_line" | cut -f 6)
-            [ "$_m" = "dub" ] && _t="$_t (dub)"
+            parse_history_line "$_line"
+            _t=$hist_title
+            [ "$hist_mode" = "dub" ] && _t="$_t (dub)"
             [ "${#_t}" -gt "$_max" ] && _max=${#_t}
         done <"$histfile"
     fi
     [ "$_max" -gt 80 ] && _max=80
-    # Episode 16 + Total 5 + Watched 7 + three gaps of 2 + fzf gutter
-    _room=$(($(table_cols) - 34 - 4))
+    # Episode 16 + Total 5 + Watched 7 + Status 13 + four gaps of 2 + fzf gutter
+    _room=$(($(table_cols) - 49 - 4))
     [ "$_room" -lt 4 ] && _room=4
     [ "$_max" -gt "$_room" ] && _max=$_room
     TABLE_TITLE_W=$_max
@@ -435,21 +579,19 @@ watch_percent() {
 
 history_header_row() {
     _tw=$(title_width)
-    _label=$(printf '%-*s  %-*s  %-*s  %s' "$_tw" "Show" 16 "Episode" 5 "Total" "Watched")
+    _label=$(printf '%-*s  %-*s  %-*s  %-*s  %-*s' "$_tw" "Show" 16 "Episode" 5 "Total" 7 "Watched" 13 "Status")
     printf 'header\t\t\t\t\t%s\n' "$_label"
 }
 
 format_table_row() {
     _tw=$(title_width)
     _title=$(fit_text "$1" "$_tw")
-    _epcell=$2
-    _totalcell=$3
-    _pctcell=$4
-    printf '%-*s  %-*s  %-*s  %s' "$_tw" "$_title" 16 "$_epcell" 5 "$_totalcell" "$_pctcell"
+    printf '%-*s  %-*s  %-*s  %-*s  %-*s' "$_tw" "$_title" 16 "$2" 5 "$3" 7 "$4" 13 "$5"
 }
 
 format_history_rows() {
     [ -f "$histfile" ] || return 0
+    read_view
     _work=$(mktemp -d) || return 1
     _n=0
     while IFS= read -r _line || [ -n "$_line" ]; do
@@ -462,18 +604,28 @@ format_history_rows() {
         ) &
     done <"$histfile"
     wait
+    : >"$_work/order"
     _i=1
     while [ "$_i" -le "$_n" ]; do
         _line=$(cat "$_work/$_i.meta")
-        _status=$(printf '%s' "$_line" | cut -f 2)
-        _pos=$(printf '%s' "$_line" | cut -f 3)
-        _dur=$(printf '%s' "$_line" | cut -f 4)
-        _ep=$(printf '%s' "$_line" | cut -f 5)
-        _mode=$(printf '%s' "$_line" | cut -f 6)
-        _id=$(printf '%s' "$_line" | cut -f 7)
-        _title=$(printf '%s' "$_line" | cut -f 8-)
+        parse_history_line "$_line"
+        _status=$hist_status
+        _pos=$hist_pos
+        _dur=$hist_dur
+        _ep=$hist_ep
+        _mode=$hist_mode
+        _id=$hist_id
+        _title=$hist_title
+        _idx=$_i
         _i=$((_i + 1))
         [ -z "$_id" ] && continue
+        _label=$(show_flag_label)
+        case "$view_filter" in
+            watching) [ "$_label" = "Watching" ] || continue ;;
+            plan) [ "$_label" = "Plan to Watch" ] || continue ;;
+            completed) [ "$_label" = "Completed" ] || continue ;;
+            dropped) [ "$_label" = "Dropped" ] || continue ;;
+        esac
         [ "$_mode" = "dub" ] && _title="$_title (dub)"
         _clock=$(format_position "$_pos")
         if [ "$_status" = "watching" ] && [ -n "$_clock" ]; then
@@ -483,16 +635,44 @@ format_history_rows() {
         fi
         _totalcell="-"
         _pctcell="-"
-        if [ -s "$_work/$((_i - 1)).eps" ]; then
-            _prog=$(watch_percent "$_work/$((_i - 1)).eps" "$_ep" "$_status" "$_pos" "$_dur") || true
+        if [ -s "$_work/$_idx.eps" ]; then
+            _prog=$(watch_percent "$_work/$_idx.eps" "$_ep" "$_status" "$_pos" "$_dur") || true
             if [ -n "$_prog" ]; then
                 _totalcell=${_prog%% *}
                 _pctcell="${_prog#* }%"
             fi
         fi
-        _display=$(format_table_row "$_title" "$_epcell" "$_totalcell" "$_pctcell")
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "resume" "$_id" "$_ep" "$_pos" "$_mode" "$_display"
+        _display=$(format_table_row "$_title" "$_epcell" "$_totalcell" "$_pctcell" "$_label")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "resume" "$_id" "$_ep" "$_pos" "$_mode" "$_display" >"$_work/item.$_idx"
+        case "$view_sort" in
+            title) _key=$_title ;;
+            status)
+                case "$_label" in
+                    Watching) _key="1 $_title" ;;
+                    "Plan to Watch") _key="2 $_title" ;;
+                    Completed) _key="3 $_title" ;;
+                    Dropped) _key="4 $_title" ;;
+                    *) _key="5 $_title" ;;
+                esac
+                ;;
+            progress)
+                case "$_pctcell" in
+                    *%) _key=$(printf '%04d' $((1000 - ${_pctcell%\%}))) ;;
+                    *) _key=1001 ;;
+                esac
+                ;;
+            *) _key=$(printf '%04d' "$_idx") ;;
+        esac
+        printf '%s\t%s\n' "$_key" "$_idx" >>"$_work/order"
     done
+    if [ -s "$_work/order" ]; then
+        case "$view_sort" in
+            progress | recent) sort -n -t "$(printf '\t')" -k1,1 "$_work/order" ;;
+            *) sort -f -t "$(printf '\t')" -k1,1 "$_work/order" ;;
+        esac | while IFS="$(printf '\t')" read -r _key _idx; do
+            cat "$_work/item.$_idx"
+        done
+    fi
     rm -rf "$_work"
 }
 
@@ -506,9 +686,15 @@ record_watch() {
     _pos=${2:-0}
     _dur=${3:-0}
     _now=$(date +%s)
+    _keep_flag=
+    _keep_line=$(history_line_for "$anime_id" || true)
+    if [ -n "$_keep_line" ]; then
+        parse_history_line "$_keep_line"
+        _keep_flag=$hist_flag
+    fi
     _tmp="${histfile}.new"
     : >"$_tmp"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$_now" "$_status" "$_pos" "$_dur" "$ep_no" "$mode" "$anime_id" "$anime_title" >>"$_tmp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$_now" "$_status" "$_pos" "$_dur" "$ep_no" "$mode" "$anime_id" "$_keep_flag" "$anime_title" >>"$_tmp"
     if [ -f "$histfile" ]; then
         while IFS= read -r _line || [ -n "$_line" ]; do
             [ -z "$_line" ] && continue
@@ -535,11 +721,8 @@ history_line_for() {
 
 prepare_resume() {
     _line=$(history_line_for "$anime_id") || die "Missing history entry"
-    hist_status=$(printf '%s' "$_line" | cut -f 2)
-    hist_pos=$(printf '%s' "$_line" | cut -f 3)
-    hist_ep=$(printf '%s' "$_line" | cut -f 5)
-    hist_mode=$(printf '%s' "$_line" | cut -f 6)
-    anime_title=$(printf '%s' "$_line" | cut -f 8-)
+    parse_history_line "$_line"
+    anime_title=$hist_title
     [ "$mode_cli" = 1 ] || mode=$hist_mode
     episode_maps="$(hianime_episodes "$anime_id")" || exit 1
     ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
@@ -570,11 +753,8 @@ select_episodes() {
 
 run_complete() {
     if [ -z "$query" ]; then
-        _rows=$(format_history_rows)
-        if [ -n "$_rows" ]; then
-            history_header_row
-            printf '%s\n' "$_rows"
-        fi
+        history_header_row
+        format_history_rows
         exit 0
     fi
     sleep 0.3
@@ -591,13 +771,25 @@ run_complete() {
 }
 
 launch_fzf() {
+    _legend=$(print_legend)
+    # Use (...) for every chained action. reload: (colon form) eats the rest of
+    # the bind string, so +transform-... used to get appended to the search query.
+    _hdr='transform-header-lines([ -n {q} ] && echo 0 || echo 1)'
     fzf --reverse --cycle --disabled \
         --prompt "Search anime: " \
         --delimiter '\t' \
         --with-nth 6 \
         --header-lines "$1" \
         --header-lines-border line \
-        --bind "change:reload:$0 --complete {q}+transform-header-lines:[ -n {q} ] && echo 0 || echo 1"
+        --footer "$_legend" \
+        --footer-border=line \
+        --bind "change:reload($0 --complete {q})+$_hdr" \
+        --bind "alt-p:execute-silent($0 --flag plan {f})+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
+        --bind "alt-c:execute-silent($0 --flag completed {f})+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
+        --bind "alt-d:execute-silent($0 --flag dropped {f})+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
+        --bind "alt-u:execute-silent($0 --flag clear {f})+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
+        --bind "alt-f:execute-silent($0 --cycle filter)+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
+        --bind "alt-s:execute-silent($0 --cycle sort)+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr"
 }
 
 fzf_launcher() {
@@ -705,7 +897,17 @@ open_launcher() {
     else
         anime_id=$pick_id
         [ -z "$anime_id" ] && exit 1
-        prepare_resume
+        _line=$(history_line_for "$anime_id") || die "Missing history entry"
+        parse_history_line "$_line"
+        if [ -z "$hist_ep" ]; then
+            anime_title=$hist_title
+            [ "$mode_cli" = 1 ] || mode=$hist_mode
+            ep_no=
+            resume_pos=
+            select_episodes
+        else
+            prepare_resume
+        fi
     fi
 }
 
@@ -888,6 +1090,7 @@ fi
 hist_dir="${GANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gani-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
 histfile="$hist_dir/history"
+view_file="$hist_dir/view"
 [ ! -f "$histfile" ] && : >"$histfile"
 script_dir=$(resolve_script_dir) || die "Could not locate gani-cli"
 progress_lua="$script_dir/gani-progress.lua"
@@ -952,6 +1155,20 @@ while [ $# -gt 0 ]; do
             ;;
         --dub) mode="dub" && mode_cli=1 ;;
         --complete) complete_mode=1 ;;
+        --flag)
+            [ $# -lt 3 ] && exit 0
+            apply_show_flag "$2" "$3"
+            exit 0
+            ;;
+        --cycle)
+            [ $# -lt 2 ] && exit 0
+            cycle_view "$2"
+            exit 0
+            ;;
+        --legend)
+            print_legend
+            exit 0
+            ;;
         --no-detach) no_detach=1 ;;
         --exit-after-play) exit_after_play=1 && no_detach=1 ;;
         --rofi) menu_program=rofi ;;
