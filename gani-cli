@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="0.3.0"
+version_number="0.4.0"
 
 # UI
 
@@ -251,28 +251,33 @@ pick_subtitle() {
     fi
 }
 
-# last resort: machine translate one of the available tracks to english.
-# sets sub_link to the cached translation, or leaves it empty and says why.
+# picks the track to machine translate to english and sets sub_link + sub_note.
+# pass "force" when the user asked for a translation from the subtitles menu.
 translate_subtitles() {
     _tr_saved="$sub_langs"
     sub_langs="$translate_from"
-    _tr_pick="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
+    _tr_pick="$(printf "%s" "$_sub_raw" | pick_subtitle)"
     sub_langs="$_tr_saved"
     _tr_url="$(printf "%s" "$_tr_pick" | cut -f 1)"
     _tr_label="$(printf "%s" "$_tr_pick" | cut -f 2)"
     if [ -z "$_tr_url" ]; then
-        _tr_others="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | sed -nE 's|.*"label":"([^"]*)".*|\1|p' | tr '\n' ' ')"
+        _tr_others="$(printf "%s" "$_sub_raw" | sed -nE 's|.*"label":"([^"]*)".*|\1|p' | tr '\n' ' ')"
         info "No subtitles for this episode in '$sub_langs' (available: ${_tr_others:-none})"
         return 0
     fi
     _tr_slug="$(printf "%s" "$_tr_label" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
     sub_link="$subs_dir/$anime_id-$ep_no-$mode-$_tr_slug-en.vtt"
+    sub_note="machine translated from $_tr_label"
     if [ -s "$sub_link" ]; then
-        info "Using the cached english translation of the $_tr_label subtitles"
+        info "Using the cached translation of the $_tr_label subtitles"
         return 0
     fi
-    if [ "$translate" != 1 ] || [ -z "$translate_bin" ]; then
+    _tr_allowed=1
+    [ "$translate" = 1 ] || [ "$1" = force ] || _tr_allowed=0
+    [ -z "$translate_bin" ] && _tr_allowed=0
+    if [ "$_tr_allowed" = 0 ]; then
         sub_link=""
+        sub_note=""
         info "No subtitles for this episode in '$sub_langs' (available: $_tr_label)"
         return 0
     fi
@@ -283,8 +288,73 @@ translate_subtitles() {
     else
         rm -f "$sub_link"
         sub_link=""
+        sub_note=""
         info "Translation failed, playing without subtitles"
     fi
+    return 0
+}
+
+# works out which subtitle track to hand to the player and records what it is.
+# sets sub_link, sub_note and sub_title_suffix from the tracks in $_sub_raw.
+select_subtitle_track() {
+    sub_link=""
+    sub_note=""
+    sub_title_suffix=""
+    case "$sub_choice" in
+        off) sub_note=off ;;
+        translate:*)
+            translate_from="$(printf "%s" "$sub_choice" | sed 's|^translate: *||')"
+            translate_subtitles force
+            ;;
+        "")
+            _sub_pick="$(printf "%s" "$_sub_raw" | pick_subtitle)"
+            sub_link="$(printf "%s" "$_sub_pick" | cut -f 1)"
+            sub_note="$(printf "%s" "$_sub_pick" | cut -f 2)"
+            # nothing in the preferred languages: translate what is there, or say why not
+            [ -z "$sub_link" ] && [ -n "$sub_langs" ] && [ "$player_function" != "download" ] && translate_subtitles
+            ;;
+        *)
+            _sub_saved="$sub_langs"
+            sub_langs="$sub_choice"
+            _sub_pick="$(printf "%s" "$_sub_raw" | pick_subtitle)"
+            sub_langs="$_sub_saved"
+            sub_link="$(printf "%s" "$_sub_pick" | cut -f 1)"
+            sub_note="$(printf "%s" "$_sub_pick" | cut -f 2)"
+            [ -z "$sub_link" ] && info "No '$sub_choice' subtitles for this episode"
+            ;;
+    esac
+    case "$sub_note" in
+        "machine translated"*) sub_title_suffix=" [translated subs]" ;;
+        *) ;;
+    esac
+}
+
+# lets the user switch the subtitle track of the episode being watched
+choose_subtitles() {
+    _cs_labels="$(printf "%s" "$_sub_raw" | sed -nE 's|.*"label":"([^"]*)".*|\1|p')"
+    _cs_translate="$(printf "%s\n" "$_cs_labels" | while IFS= read -r _cs_label; do
+        [ -z "$_cs_label" ] && continue
+        case " $sub_langs " in
+            *" $_cs_label "*) ;;
+            *) printf 'translate: %s\n' "$_cs_label" ;;
+        esac
+    done)"
+    _cs_current="$sub_choice"
+    if [ -z "$_cs_current" ]; then
+        case "$sub_note" in
+            "machine translated from "*) _cs_current="translate: ${sub_note#machine translated from }" ;;
+            *) _cs_current="$sub_note" ;;
+        esac
+    fi
+    _cs_choice="$(printf '%s\n%s\noff\n' "$_cs_labels" "$_cs_translate" | sed '/^$/d' |
+        while IFS= read -r _cs_entry; do
+            [ "$_cs_entry" = "$_cs_current" ] && printf '* %s\n' "$_cs_entry" || printf '%s\n' "$_cs_entry"
+        done | menu "Subtitles: " "" "$menu_extra_flags")"
+    _cs_choice="$(printf "%s" "$_cs_choice" | sed 's|^\* ||')"
+    [ -z "$_cs_choice" ] && return 0
+    sub_choice="$_cs_choice"
+    select_subtitle_track
+    info "Subtitles: ${sub_note:-$sub_choice} - play again to load it"
     return 0
 }
 
@@ -305,10 +375,8 @@ hianime_m3u8() {
     _json="$(deobfuscate_blob "$_blob")"
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
-    sub_pick="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
-    sub_link="$(printf "%s" "$sub_pick" | cut -f 1)"
-    # nothing in the preferred languages: translate what is there, or say why not
-    [ -z "$sub_link" ] && [ -n "$sub_langs" ] && [ "$player_function" != "download" ] && translate_subtitles
+    _sub_raw="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g')"
+    select_subtitle_track
     # quality variants are relative to the master playlist
     links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
     [ -n "$links" ]
@@ -1034,6 +1102,7 @@ play_episode() {
     [ -z "$video_link" ] && get_video_link
     skip_flag=""
     [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -i "$mal_id" -e "$ep_no")"
+    [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && info "Subtitles: ${sub_note:-none}"
     apply_mpv_progress
     record_watch watching "${_store_pos:-0}" 0
     unset resume_pos
@@ -1044,12 +1113,12 @@ play_episode() {
         debug) printf "All links:\n%s\nSelected link:\n%s\nSubtitles:\n%s\n" "$links" "$video_link" "$sub_link" ;;
         android_mpv) android_mpv ;;
         android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
+        *flatpak*mpv*) flatpak run io.mpv.Mpv --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --osd-playing-msg="Subtitles: ${sub_note:-none}" --osd-playing-msg-duration=4000 $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}${sub_title_suffix}" "$video_link" >/dev/null 2>&1 & ;;
         *mpv*)
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --osd-playing-msg="Subtitles: ${sub_note:-none}" --osd-playing-msg-duration=4000 $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}${sub_title_suffix}" "$video_link" >/dev/null 2>&1 &
             else
-                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+                $player_function --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --osd-playing-msg="Subtitles: ${sub_note:-none}" --osd-playing-msg-duration=4000 $skip_flag $mpv_progress_flags $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}${sub_title_suffix}" "$video_link"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
             fi
@@ -1065,7 +1134,7 @@ play_episode() {
             fi
             ;;
         *vlc*) nohup $player_function --http-referrer="$refr" $player_extra_flags --play-and-exit --meta-title="${anime_title} Episode ${ep_no}" "$video_link" ${sub_link:+:input-slave="$sub_link"} >/dev/null 2>&1 & ;;
-        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --force-media-title="${anime_title} Episode ${ep_no}" >/dev/null 2>&1 & ;;
+        *yncpla*) nohup $player_function $player_extra_flags "$video_link" -- $skip_flag --referrer="$refr" ${sub_link:+--sub-file="$sub_link"} --osd-playing-msg="Subtitles: ${sub_note:-none}" --osd-playing-msg-duration=4000 --force-media-title="${anime_title} Episode ${ep_no}${sub_title_suffix}" >/dev/null 2>&1 & ;;
         download) "$player_function" "$video_link" "${anime_title} Episode ${ep_no}" $player_extra_flags ;;
         catt) nohup catt cast $player_extra_flags "$video_link" >/dev/null 2>&1 & ;;
         iSH)
@@ -1129,6 +1198,9 @@ sub_langs="${GANI_CLI_SUB_LANG:-English Portuguese German Spanish}"
 # translate an available track on the fly when none of the preferred languages is offered
 translate="${GANI_CLI_TRANSLATE:-1}"
 translate_from="${GANI_CLI_TRANSLATE_FROM:-Indonesian Vietnamese Thai}"
+# subtitle track to use for this run: empty is automatic, else off, a track label
+# or "translate: <label>". Also settable from the player menu.
+sub_choice="${GANI_CLI_SUB_CHOICE:-}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
 
@@ -1308,7 +1380,8 @@ tput sc
 play
 [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
 
-while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
+while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nsubtitles\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
+    _skip_play=""
     case "$cmd" in
         next)
             unset resume_pos
@@ -1331,13 +1404,17 @@ while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nquit" | nth 
             [ -z "$new_quality" ] && die "No quality selected"
             select_quality "$new_quality"
             ;;
+        subtitles)
+            choose_subtitles
+            _skip_play=1
+            ;;
         *)
             cleanup
             exit 0
             ;;
     esac
     [ -z "$ep_no" ] && die "Out of range"
-    play
+    [ -z "$_skip_play" ] && play
 done
 
 # gani-cli
