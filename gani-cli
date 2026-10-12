@@ -354,7 +354,14 @@ choose_subtitles() {
     [ -z "$_cs_choice" ] && return 0
     sub_choice="$_cs_choice"
     select_subtitle_track
-    info "Subtitles: ${sub_note:-$sub_choice} - play again to load it"
+    # replaying to pick the new track up should not throw away the watch position
+    _cs_line="$(history_line_for "$anime_id")" || _cs_line=""
+    resume_pos="$(printf "%s" "$_cs_line" | cut -f 3)"
+    case "$resume_pos" in
+        '' | *[!0-9.]*) resume_pos="" ;;
+        *) _keep_resume=1 ;;
+    esac
+    info "Subtitles: ${sub_note:-$sub_choice} - pick replay to switch"
     return 0
 }
 
@@ -1388,7 +1395,8 @@ while cmd=$(printf "next\nreplay\nprevious\nselect\nchange_quality\nsubtitles\nq
             ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
             ;;
         replay)
-            unset resume_pos
+            [ -n "$_keep_resume" ] || unset resume_pos
+            unset _keep_resume
             video_link="$replay"
             ;;
         previous)
