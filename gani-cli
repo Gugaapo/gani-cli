@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="0.1.1"
+version_number="0.2.0"
 
 # UI
 
@@ -225,14 +225,30 @@ hianime_episodes() {
         sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${1}[?]ep=.*|\\2\\t\\1|p"
 }
 
-# prints the subtitle url out of the entries of the "subtitles" array given on stdin
-# episodes are not always uploaded with a default track, so English and the first track are fallbacks
+# prints "<url><tab><label>" of the subtitle track to take, from the entries of the
+# "subtitles" array given on stdin: the first language of $sub_langs that is present,
+# preferring a plain label ("English") over variants ("English (SDH)") and over
+# forced-only ones. Episodes offering only other languages get no subtitle at all.
 pick_subtitle() {
     _sub_entries="$(cat -)"
-    _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"default":true')"
-    [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"label":"English')"
-    [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"lang":"')"
-    [ -z "$_sub_track" ] || printf "%s" "$_sub_track" | sed -nE 's|.*"src":"([^"]*)".*|\1|p'
+    _sub_track=""
+    if [ -n "$sub_langs" ]; then
+        # shellcheck disable=SC2086 # word splitting on $sub_langs is intended
+        for _sub_lang in $sub_langs; do
+            _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 "\"label\":\"${_sub_lang}\"")"
+            [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -v '(Forced)' | grep -m 1 "\"label\":\"${_sub_lang}")"
+            [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 "\"label\":\"${_sub_lang}")"
+            [ -n "$_sub_track" ] && break
+        done
+    else
+        _sub_track="$(printf "%s" "$_sub_entries" | grep -v '(Forced)' | grep -m 1 '"default":true')"
+        [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"lang":"')"
+    fi
+    if [ -n "$_sub_track" ]; then
+        _sub_url="$(printf "%s" "$_sub_track" | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
+        _sub_name="$(printf "%s" "$_sub_track" | sed -nE 's|.*"label":"([^"]*)".*|\1|p')"
+        printf "%s\t%s" "$_sub_url" "$_sub_name"
+    fi
 }
 
 # resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
@@ -252,7 +268,12 @@ hianime_m3u8() {
     _json="$(deobfuscate_blob "$_blob")"
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
-    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
+    sub_pick="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
+    sub_link="$(printf "%s" "$sub_pick" | cut -f 1)"
+    if [ -z "$sub_link" ] && [ -n "$sub_langs" ]; then
+        _sub_others="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | sed -nE 's|.*"label":"([^"]*)".*|\1|p' | tr '\n' ' ')"
+        info "No subtitles for this episode in '$sub_langs' (available: ${_sub_others:-none})"
+    fi
     # quality variants are relative to the master playlist
     links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
     [ -n "$links" ]
@@ -1067,6 +1088,9 @@ download_dir="${GANI_CLI_DOWNLOAD_DIR:-${ANI_CLI_DOWNLOAD_DIR:-.}}"
 log_episode="${GANI_CLI_LOG:-${ANI_CLI_LOG:-1}}"
 quality="${GANI_CLI_QUALITY:-${ANI_CLI_QUALITY:-best}}"
 exact_match="${GANI_CLI_EXACT:-${ANI_CLI_EXACT:-0}}"
+# subtitle languages to prefer, in priority order, matched against the track label.
+# empty means "take whichever single track the episode offers"
+sub_langs="${GANI_CLI_SUB_LANG:-English Portuguese German Spanish}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
 
