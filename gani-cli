@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="0.1.0"
+version_number="0.1.1"
 
 # UI
 
@@ -225,6 +225,16 @@ hianime_episodes() {
         sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${1}[?]ep=.*|\\2\\t\\1|p"
 }
 
+# prints the subtitle url out of the entries of the "subtitles" array given on stdin
+# episodes are not always uploaded with a default track, so English and the first track are fallbacks
+pick_subtitle() {
+    _sub_entries="$(cat -)"
+    _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"default":true')"
+    [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"label":"English')"
+    [ -z "$_sub_track" ] && _sub_track="$(printf "%s" "$_sub_entries" | grep -m 1 '"lang":"')"
+    [ -z "$_sub_track" ] || printf "%s" "$_sub_track" | sed -nE 's|.*"src":"([^"]*)".*|\1|p'
+}
+
 # resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
 hianime_m3u8() {
     _ep_id=$(printf "%s" "$episode_maps" | sed -nE "s|^([0-9]+)\t${1}$|\1|p")
@@ -242,7 +252,7 @@ hianime_m3u8() {
     _json="$(deobfuscate_blob "$_blob")"
     _m3u8_master="$(printf "%s" "$_json" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p')"
     [ -z "$_m3u8_master" ] && return 1
-    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | grep -m 1 '"default":true' | sed -nE 's|.*"src":"([^"]*)".*|\1|p')"
+    sub_link="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
     # quality variants are relative to the master playlist
     links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
     [ -n "$links" ]
