@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="0.2.0"
+version_number="0.3.0"
 
 # UI
 
@@ -251,6 +251,43 @@ pick_subtitle() {
     fi
 }
 
+# last resort: machine translate one of the available tracks to english.
+# sets sub_link to the cached translation, or leaves it empty and says why.
+translate_subtitles() {
+    _tr_saved="$sub_langs"
+    sub_langs="$translate_from"
+    _tr_pick="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
+    sub_langs="$_tr_saved"
+    _tr_url="$(printf "%s" "$_tr_pick" | cut -f 1)"
+    _tr_label="$(printf "%s" "$_tr_pick" | cut -f 2)"
+    if [ -z "$_tr_url" ]; then
+        _tr_others="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | sed -nE 's|.*"label":"([^"]*)".*|\1|p' | tr '\n' ' ')"
+        info "No subtitles for this episode in '$sub_langs' (available: ${_tr_others:-none})"
+        return 0
+    fi
+    _tr_slug="$(printf "%s" "$_tr_label" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
+    sub_link="$subs_dir/$anime_id-$ep_no-$mode-$_tr_slug-en.vtt"
+    if [ -s "$sub_link" ]; then
+        info "Using the cached english translation of the $_tr_label subtitles"
+        return 0
+    fi
+    if [ "$translate" != 1 ] || [ -z "$translate_bin" ]; then
+        sub_link=""
+        info "No subtitles for this episode in '$sub_langs' (available: $_tr_label)"
+        return 0
+    fi
+    info "Translating the $_tr_label subtitles to english..."
+    mkdir -p "$subs_dir"
+    if "$translate_bin" --referer "$refr" --source-label "$_tr_label" "$_tr_url" "$sub_link"; then
+        info "Subtitles translated"
+    else
+        rm -f "$sub_link"
+        sub_link=""
+        info "Translation failed, playing without subtitles"
+    fi
+    return 0
+}
+
 # resolves episode $1 in mode $2 (sub/dub): sets links (quality >url per line), sub_link, mal_id and refr
 hianime_m3u8() {
     _ep_id=$(printf "%s" "$episode_maps" | sed -nE "s|^([0-9]+)\t${1}$|\1|p")
@@ -270,10 +307,8 @@ hianime_m3u8() {
     [ -z "$_m3u8_master" ] && return 1
     sub_pick="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | pick_subtitle)"
     sub_link="$(printf "%s" "$sub_pick" | cut -f 1)"
-    if [ -z "$sub_link" ] && [ -n "$sub_langs" ]; then
-        _sub_others="$(printf "%s" "$_json" | sed 's|.*"subtitles":\[||; s|}\].*||; s|},{|}\n{|g' | sed -nE 's|.*"label":"([^"]*)".*|\1|p' | tr '\n' ' ')"
-        info "No subtitles for this episode in '$sub_langs' (available: ${_sub_others:-none})"
-    fi
+    # nothing in the preferred languages: translate what is there, or say why not
+    [ -z "$sub_link" ] && [ -n "$sub_langs" ] && [ "$player_function" != "download" ] && translate_subtitles
     # quality variants are relative to the master playlist
     links="$(hianime_curl "$_m3u8_master" -e "$refr" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d' | sed "\|>https*://|!s|>|>${_m3u8_master%/*}/|" | sort -g -r -s)"
     [ -n "$links" ]
@@ -1091,6 +1126,9 @@ exact_match="${GANI_CLI_EXACT:-${ANI_CLI_EXACT:-0}}"
 # subtitle languages to prefer, in priority order, matched against the track label.
 # empty means "take whichever single track the episode offers"
 sub_langs="${GANI_CLI_SUB_LANG:-English Portuguese German Spanish}"
+# translate an available track on the fly when none of the preferred languages is offered
+translate="${GANI_CLI_TRANSLATE:-1}"
+translate_from="${GANI_CLI_TRANSLATE_FROM:-Indonesian Vietnamese Thai}"
 
 curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
 
@@ -1125,9 +1163,14 @@ hist_dir="${GANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gani-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
 histfile="$hist_dir/history"
 view_file="$hist_dir/view"
+subs_dir="$hist_dir/subs"
 [ ! -f "$histfile" ] && : >"$histfile"
 script_dir=$(resolve_script_dir) || die "Could not locate gani-cli"
 progress_lua="$script_dir/gani-progress.lua"
+# the translator helper, either on PATH or next to this script
+translate_bin="${GANI_CLI_TRANSLATE_BIN:-}"
+[ -z "$translate_bin" ] && command -v gani-translate >/dev/null 2>&1 && translate_bin="gani-translate"
+[ -z "$translate_bin" ] && [ -x "$script_dir/gani-translate" ] && translate_bin="$script_dir/gani-translate"
 
 source="${GANI_CLI_DEFAULT_SOURCE:-${ANI_CLI_DEFAULT_SOURCE:-search}}"
 branch="${GANI_CLI_BRANCH:-${ANI_CLI_BRANCH:-master}}"

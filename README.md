@@ -577,6 +577,7 @@ Ani-skip uses the external lua script function of mpv and as such â€“ for now â€
 <details>
 	
 * Can I change subtitle language or turn them off? - Yes: the subtitle track is picked by `GANI_CLI_SUB_LANG`, a space separated list of preferred label prefixes in priority order (default `English Portuguese German Spanish`). Episodes that offer none of them get no subtitle at all. Set it to empty (`GANI_CLI_SUB_LANG=`) to always take whatever track the episode offers. You can also toggle them in the player (mpv: press `v`).
+* What if the episode only has subtitles I do not understand? - The closest available track is machine translated to English by `gani-translate` and cached in `~/.local/state/gani-cli/subs`, so it is only translated once. `GANI_CLI_TRANSLATE_FROM` (default `Indonesian Vietnamese Thai`) sets which track is used as the source and `GANI_CLI_TRANSLATE=0` turns the whole thing off. Expect roughly translated English, not a proper subtitle.
 * Can I watch dub? - Yes, use `--dub`.
 * Can I change dub language? - No.
 * Can I change media source? - No (unless you can scrape that source yourself).
