@@ -603,7 +603,7 @@ sort_label() {
 print_legend() {
     read_view
     printf 'alt-p  Plan to Watch    alt-c  Completed    alt-d  Dropped    alt-u  Clear\n'
-    printf 'alt-f  Filter: %s    alt-s  Sort: %s\n' "$(filter_label)" "$(sort_label)"
+    printf 'alt-f  Filter: %s    alt-s  Sort: %s    alt-i  Info pane\n' "$(filter_label)" "$(sort_label)"
 }
 
 apply_show_flag() {
@@ -960,13 +960,17 @@ info_fields() {
     [ -n "$_syn" ] || _syn=$(page_block '<div class="film-description">')
 }
 
-# the width of the pane fzf gave us
+# the width of the pane. fzf's own FZF_PREVIEW_COLUMNS is not always exported to the
+# preview command (it was missing on fzf 0.74.3 here), so the launcher hands the width
+# over instead; running --info by hand falls back to the terminal width
 info_width() {
-    _w=${FZF_PREVIEW_COLUMNS:-${COLUMNS:-60}}
+    _w=${GANI_CLI_PANE_W:-${FZF_PREVIEW_COLUMNS:-${COLUMNS:-60}}}
     case "$_w" in
         '' | *[!0-9]*) _w=60 ;;
         *) ;;
     esac
+    # the pane's own left border takes a column
+    _w=$((_w - 2))
     [ "$_w" -lt 20 ] && _w=20
     printf '%s' "$_w"
 }
@@ -1145,6 +1149,13 @@ launch_fzf() {
     # Use (...) for every chained action. reload: (colon form) eats the rest of
     # the bind string, so +transform-... used to get appended to the search query.
     _hdr='transform-header-lines([ -n {q} ] && echo 0 || echo 1)'
+    # {2} is the anime slug for both kinds of row (resume and search), and $0 is this
+    # script: the shell expands it here, so fzf receives the real path
+    if [ "${GANI_CLI_PANE_W:-0}" -ge "$info_pane_min" ]; then
+        _preview_window="right,${GANI_CLI_PANE_W},border-left,wrap"
+    else
+        _preview_window="hidden,right,${info_pane_min},border-left,wrap"
+    fi
     fzf --reverse --cycle --disabled \
         --prompt "Search anime: " \
         --delimiter '\t' \
@@ -1153,6 +1164,10 @@ launch_fzf() {
         --header-lines-border line \
         --footer "$_legend" \
         --footer-border=line \
+        --preview "$0 --info {2}" \
+        --preview-window "$_preview_window" \
+        --preview-label Info \
+        --bind alt-i:toggle-preview \
         --bind "change:reload($0 --complete {q})+$_hdr" \
         --bind "alt-p:execute-silent($0 --flag plan {f})+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
         --bind "alt-c:execute-silent($0 --flag completed {f})+reload($0 --complete {q})+transform-footer($0 --legend)+$_hdr" \
@@ -1166,6 +1181,12 @@ fzf_launcher() {
     GANI_CLI_COLS=$(tput cols 2>/dev/null || printf 100)
     export GANI_CLI_COLS
     _rows=$(format_history_rows)
+    # the title column already tracks the longest title found, so the info pane gets the
+    # columns the table does not need. 53 is the same fixed cost set_title_width uses:
+    # Episode + Total + Watched + Status, their four gaps, and fzf's own gutter
+    GANI_CLI_PANE_W=$(($(table_cols) - $(title_width) - 53))
+    [ "$GANI_CLI_PANE_W" -ge 0 ] || GANI_CLI_PANE_W=0
+    export GANI_CLI_PANE_W
     if [ -n "$_rows" ]; then
         {
             history_header_row
@@ -1460,6 +1481,9 @@ exit_after_play="${GANI_CLI_EXIT_AFTER_PLAY:-${ANI_CLI_EXIT_AFTER_PLAY:-0}}"
 skip_intro="${GANI_CLI_SKIP_INTRO:-${ANI_CLI_SKIP_INTRO:-0}}"
 menu_program="${GANI_CLI_MENU:-${ANI_CLI_MENU:-fzf}}"
 menu_extra_flags="${GANI_CLI_MENU_FLAGS:-${ANI_CLI_MENU_FLAGS:-""}}"
+# the info pane needs this many columns before it is worth showing: below it fzf starts
+# with the pane hidden and alt-i brings it up
+info_pane_min=30
 
 # not opening from a terminal
 if [ ! -t 0 ]; then
