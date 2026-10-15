@@ -1017,6 +1017,63 @@ info_render() {
     fi
 }
 
+# how long a cached panel stays valid, in seconds. GANI_CLI_INFO_TTL takes seconds or a
+# d/h/m suffix (7d, 30d, 12h) and 0 always refetches. Default is 7 days.
+info_ttl() {
+    _t=${GANI_CLI_INFO_TTL:-7d}
+    _mult=86400
+    case "$_t" in
+        *h) _mult=3600 ;;
+        *m) _mult=60 ;;
+        *[0-9]) _mult=1 ;;
+        *) ;;
+    esac
+    _n=${_t%[dhm]}
+    case "$_n" in
+        '' | *[!0-9]*) _n=7 ;;
+        *) ;;
+    esac
+    printf '%s' "$((_n * _mult))"
+}
+
+info_cache_fresh() {
+    _ttl=$(info_ttl)
+    [ "$_ttl" -gt 0 ] || return 1
+    [ -f "$_cache_file" ] || return 1
+    _ver=$(cut -f 1 "$_cache_file")
+    [ "$_ver" = v1 ] || return 1
+    _at=$(cut -f 2 "$_cache_file")
+    case "$_at" in
+        '' | *[!0-9]*) return 1 ;;
+        *) ;;
+    esac
+    _now=$(date +%s)
+    [ "$((_now - _at))" -le "$_ttl" ]
+}
+
+# one line: the format version, when it was fetched, then the fields.
+# the return happens inside the loop on purpose: the read that finally hits EOF clears
+# every variable it was given, so reading the values after the loop yields nothing
+info_cache_read() {
+    while IFS="$(printf '\t')" read -r _ver _at _title _jname _jp _status _aired _score _genres _studios _sub _dub _eps _syn; do
+        return 0
+    done <"$_cache_file"
+}
+
+# the write goes through a temporary file and is renamed, so a killed preview cannot
+# leave a half written record behind
+info_cache_write() {
+    _now=$(date +%s)
+    {
+        printf 'v1\t%s' "$_now"
+        for _field in "$_title" "$_jname" "$_jp" "$_status" "$_aired" "$_score" "$_genres" "$_studios" "$_sub" "$_dub" "$_eps" "$_syn"; do
+            _val=$(printf '%s' "$_field" | tr '\n\t' '  ')
+            printf '\t%s' "$_val"
+        done
+        printf '\n'
+    } >"$_cache_file.new" && mv "$_cache_file.new" "$_cache_file"
+}
+
 # prints the info pane of the anime slug $1 to stdout. Internal: the picker runs it
 # as `gani-cli --info <slug>` from fzf's preview window, so it must exit before any
 # other startup output reaches stdout.
@@ -1026,12 +1083,18 @@ show_info() {
         "" | __search__*) return 0 ;;
         *) ;;
     esac
-    # the fetched page is written under the state dir with a name derived from the slug,
-    # so a preview killed mid render (fzf does that on every cursor move) leaves one
-    # reusable file instead of a fresh temp file each time
+    # the page and the cached panel live under the state dir, named after the slug: a
+    # preview killed mid render (fzf does that on every cursor move) leaves one reusable
+    # file instead of a fresh temp file each time
     _safe=$(printf '%s' "$_slug" | sed 's|[^A-Za-z0-9._-]|_|g;s|^[.]*||')
     [ -n "$_safe" ] || return 0
     [ -d "$hist_dir/info" ] || mkdir -p "$hist_dir/info" || return 0
+    _cache_file="$hist_dir/info/$_safe"
+    if info_cache_fresh; then
+        info_cache_read
+        info_render
+        return 0
+    fi
     _page_file="$hist_dir/info/.page.$_safe"
     info_page "$_slug" "$_page_file"
     case "$?" in
@@ -1048,13 +1111,14 @@ show_info() {
             ;;
     esac
     info_fields
+    rm -f "$_page_file"
     if [ -z "$_title" ] && [ -z "$_syn" ]; then
-        rm -f "$_page_file"
         info_note "no info available (page layout not recognised)"
         return 0
     fi
+    # nothing above is cached, so a block or an outage cannot stick for the whole ttl
+    info_cache_write
     info_render
-    rm -f "$_page_file"
 }
 
 run_complete() {
