@@ -892,12 +892,169 @@ select_episodes() {
     resume_pos=
 }
 
+# fetches the anime page for the slug $1 into the file $2. Returns 1 when the page
+# cannot be fetched and 2 when cloudflare answers instead. hianime_curl dies on a
+# transport error, so it runs in a subshell with its message dropped: the pane reports
+# the failure itself and must never abort the picker.
+info_page() {
+    (hianime_curl "${base_api}/$1") >"$2" 2>/dev/null || return 1
+    [ -s "$2" ] || return 1
+    grep -qi "<title>Just a moment" "$2" && return 2
+    return 0
+}
+
+# The page is read line by line. Cutting a 240KB single line with the shell's own
+# pattern removal costs seconds per field (measured: 2.3-5.2s each), while sed addresses
+# over the same page cost milliseconds. The metadata markers are unique in the page; the
+# film-stats ticks repeat, so those are matched with q and the first one wins.
+# the value on the line after the one holding marker $1, with tags stripped
+page_line() {
+    sed -n "/$1/{n;s/<[^>]*>//g;s/^[[:space:]]*//;s/[[:space:]]*$//;p;q;}" "$_page_file"
+}
+
+# the labels of the links in the block opened by marker $1, joined with a comma.
+# paste -d takes a list of delimiters and cycles through them, so the join is done with
+# a single comma and the space is added afterwards
+page_links() {
+    sed -n "/$1/,/<\/div>/p" "$_page_file" | sed -n 's/.*<a [^>]*title="\([^"]*\)".*/\1/p' | paste -sd ',' - | sed 's/,/, /g'
+}
+
+# the number on the film-stats tick named $1, e.g. 220 for "sub". The tick spans two
+# lines (the div, then the icon and the number), so the newline is dropped before the
+# digits are collected
+page_tick() {
+    sed -n "/tick-item tick-$1\">/{p;n;p;q;}" "$_page_file" | sed -e 's/<[^>]*>//g' | tr -d '\n' | sed 's/[^0-9]//g'
+}
+
+# the text of the block opened by marker $1, tags stripped, lines joined and the
+# source's indentation squeezed away
+page_block() {
+    sed -n "/$1/,/<\/div>/p" "$_page_file" | sed -e 's/<[^>]*>//g' | sed '/^[[:space:]]*$/d' |
+        paste -sd ' ' - | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+html_unescape() {
+    printf '%s' "$1" | sed -e 's|&#039;|'"'"'|g' -e 's|&quot;|"|g' -e 's|&amp;|\&|g'
+}
+
+info_note() {
+    printf '\033[2m%s\033[0m\n' "$*"
+}
+
+# fills the info fields from the fetched page
+info_fields() {
+    _title=$(page_line '<h2 class="film-name dynamic-name"')
+    _jname=$(sed -n '/<h2 class="film-name dynamic-name"/{s/.*data-jname="//;s/".*//;p;q;}' "$_page_file")
+    _jp=$(page_line 'item-head">Japanese:<\/span>')
+    _status=$(page_line 'item-head">Status:<\/span>')
+    _aired=$(page_line 'item-head">Aired:<\/span>')
+    _score=$(page_line 'item-head">MAL Score:<\/span>')
+    _studios=$(page_links 'item-head">Studios:<\/span>')
+    _genres=$(page_links 'item-head">Genres:<\/span>')
+    _sub=$(page_tick sub)
+    _dub=$(page_tick dub)
+    _eps=$(page_tick eps)
+    _syn=$(page_block '<div class="film-description m-hide">')
+    # the overview is also in anisc-info; fall back to it, then to the bare block
+    [ -n "$_syn" ] || _syn=$(page_block 'item-head">Overview:<\/span>')
+    [ -n "$_syn" ] || _syn=$(page_block '<div class="film-description">')
+}
+
+# the width of the pane fzf gave us
+info_width() {
+    _w=${FZF_PREVIEW_COLUMNS:-${COLUMNS:-60}}
+    case "$_w" in
+        '' | *[!0-9]*) _w=60 ;;
+        *) ;;
+    esac
+    [ "$_w" -lt 20 ] && _w=20
+    printf '%s' "$_w"
+}
+
+info_render() {
+    _w=$(info_width)
+    if [ -n "$_title" ]; then
+        _val=$(html_unescape "$_title")
+        printf '\033[1;36m%s\033[0m\n' "$_val"
+    fi
+    # the site's alternate name, and the Japanese one: shown only when they add anything
+    if [ -n "$_jname" ] && [ "$_jname" != "$_title" ]; then
+        _val=$(html_unescape "$_jname")
+        printf '\033[1m%s\033[0m\n' "$_val"
+    fi
+    if [ -n "$_jp" ] && [ "$_jp" != "$_jname" ] && [ "$_jp" != "$_title" ]; then
+        _val=$(html_unescape "$_jp")
+        printf '\033[2m%s\033[0m\n' "$_val"
+    fi
+    _line=$_status
+    [ -n "$_aired" ] && _line="${_line:+$_line · }$_aired"
+    [ -n "$_score" ] && _line="${_line:+$_line · }MAL $_score"
+    if [ -n "$_line" ]; then
+        _val=$(html_unescape "$_line")
+        printf '\033[2m%s\033[0m\n' "$_val"
+    fi
+    if [ -n "$_genres" ]; then
+        _val=$(html_unescape "$_genres")
+        printf '\033[2m%s\033[0m\n' "$_val"
+    fi
+    _counts=
+    if [ -n "$_eps" ]; then
+        _counts="$_eps ep"
+        [ "$_eps" = "1" ] || _counts="${_counts}s"
+    fi
+    [ -n "$_sub" ] && _counts="${_counts:+$_counts · }sub $_sub"
+    [ -n "$_dub" ] && _counts="${_counts:+$_counts · }dub $_dub"
+    [ -n "$_counts" ] && printf '\033[2m%s\033[0m\n' "$_counts"
+    if [ -n "$_studios" ]; then
+        _val=$(html_unescape "$_studios")
+        printf '\033[2m%s\033[0m\n' "$_val"
+    fi
+    _rule=$(printf '%*s' "$_w" '' | tr ' ' '-')
+    printf '\033[2m%s\033[0m\n\n' "$_rule"
+    if [ -n "$_syn" ]; then
+        _val=$(html_unescape "$_syn")
+        printf '%s\n' "$_val" | fold -s -w "$_w" | sed 's/[[:space:]]*$//'
+    fi
+}
+
 # prints the info pane of the anime slug $1 to stdout. Internal: the picker runs it
 # as `gani-cli --info <slug>` from fzf's preview window, so it must exit before any
 # other startup output reaches stdout.
 show_info() {
-    [ -n "${1:-}" ] || return 0
-    printf '%s\n' "$1"
+    _slug=${1:-}
+    case "$_slug" in
+        "" | __search__*) return 0 ;;
+        *) ;;
+    esac
+    # the fetched page is written under the state dir with a name derived from the slug,
+    # so a preview killed mid render (fzf does that on every cursor move) leaves one
+    # reusable file instead of a fresh temp file each time
+    _safe=$(printf '%s' "$_slug" | sed 's|[^A-Za-z0-9._-]|_|g;s|^[.]*||')
+    [ -n "$_safe" ] || return 0
+    [ -d "$hist_dir/info" ] || mkdir -p "$hist_dir/info" || return 0
+    _page_file="$hist_dir/info/.page.$_safe"
+    info_page "$_slug" "$_page_file"
+    case "$?" in
+        0) ;;
+        2)
+            rm -f "$_page_file"
+            info_note "no info available (blocked by cloudflare)"
+            return 0
+            ;;
+        *)
+            rm -f "$_page_file"
+            info_note "no info available (unreachable)"
+            return 0
+            ;;
+    esac
+    info_fields
+    if [ -z "$_title" ] && [ -z "$_syn" ]; then
+        rm -f "$_page_file"
+        info_note "no info available (page layout not recognised)"
+        return 0
+    fi
+    info_render
+    rm -f "$_page_file"
 }
 
 run_complete() {
@@ -1322,8 +1479,9 @@ while [ $# -gt 0 ]; do
         --dub) mode="dub" && mode_cli=1 ;;
         --complete) complete_mode=1 ;;
         --info)
+            [ $# -lt 2 ] && exit 0
             info_mode=1
-            info_slug=${2:-}
+            info_slug=$2
             shift
             ;;
         --flag)
