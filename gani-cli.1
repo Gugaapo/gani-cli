@@ -13,7 +13,7 @@ This tool scrapes the site hianime.
 .PD 0
 .P
 .PD
-\f[B]gani-cli\f[R] is a fork of ani-cli. With no search query it opens a search bar with your recent shows underneath. Typing replaces that list with search results. It defaults to iina on macOS, flatpak mpv on Steamdeck, mpv apk on android, vlc on iOS and mpv media player everywhere else.
+\f[B]gani-cli\f[R] is a fork of ani-cli. With no search query it opens a search bar with your recent shows underneath. Typing replaces that list with search results. The pane beside the list shows the highlighted show's synopsis, alternate and Japanese names, status, air dates, MAL score, genres, studios, and episode, sub and dub counts; alt-i hides or shows it. It defaults to iina on macOS, flatpak mpv on Steamdeck, mpv apk on android, vlc on iOS and mpv media player everywhere else.
 .SH OPTIONS
 .TP
 \fB\-e | --episode | -r | --range\fR \fI\,<episode>\/\fR
@@ -107,6 +107,9 @@ Controls the logging feature for playback. Can be 1(logs) or 0(doesn't log). Def
 .TP
 \fBGANI_CLI_HIST_DIR\fR
 Directory for gani-cli watch progress. Default is $XDG_STATE_HOME/gani-cli or $HOME/.local/state/gani-cli. The history file is named history. This is separate from ani-cli and is not read from ANI_CLI_HIST_DIR.
+.TP
+\fBGANI_CLI_INFO_TTL\fR
+How long the cached details behind the info pane (synopsis, alternate names, status, air dates, MAL score, genres, studios, and episode, sub and dub counts) stay valid. Accepts seconds, or a d/h/m suffix such as 7d, 30d or 12h. 0 refetches every time. Default is 7d. The cache lives under GANI_CLI_HIST_DIR/info. The sub and dub numbers are the site's own counters, not a promise that both cuts play.
 .TP
 \fBANI_CLI_DEFAULT_SOURCE\fR
 Controls the default source. Valid is history (equivalent to -c), everything else means search. Default is search.
