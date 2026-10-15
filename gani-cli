@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="0.4.0"
+version_number="0.5.0"
 
 # UI
 
@@ -892,6 +892,14 @@ select_episodes() {
     resume_pos=
 }
 
+# prints the info pane of the anime slug $1 to stdout. Internal: the picker runs it
+# as `gani-cli --info <slug>` from fzf's preview window, so it must exit before any
+# other startup output reaches stdout.
+show_info() {
+    [ -n "${1:-}" ] || return 0
+    printf '%s\n' "$1"
+}
+
 run_complete() {
     if [ -z "$query" ]; then
         history_header_row
@@ -1254,6 +1262,8 @@ translate_bin="${GANI_CLI_TRANSLATE_BIN:-}"
 source="${GANI_CLI_DEFAULT_SOURCE:-${ANI_CLI_DEFAULT_SOURCE:-search}}"
 branch="${GANI_CLI_BRANCH:-${ANI_CLI_BRANCH:-master}}"
 complete_mode=0
+info_mode=0
+info_slug=
 mode_cli=0
 
 while [ $# -gt 0 ]; do
@@ -1311,6 +1321,11 @@ while [ $# -gt 0 ]; do
             ;;
         --dub) mode="dub" && mode_cli=1 ;;
         --complete) complete_mode=1 ;;
+        --info)
+            info_mode=1
+            info_slug=${2:-}
+            shift
+            ;;
         --flag)
             [ $# -lt 3 ] && exit 0
             apply_show_flag "$2" "$3"
@@ -1340,6 +1355,11 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$info_mode" = 1 ]; then
+    show_info "$info_slug"
+    exit 0
+fi
 
 if [ "$complete_mode" = 1 ]; then
     run_complete
